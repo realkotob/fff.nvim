@@ -5,8 +5,9 @@ use fff::frecency::FrecencyTracker;
 use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
-    DbHealthChecker, Error, FFFMode, FileSearchConfig, FuzzySearchOptions, PaginationArgs,
-    QueryParser, Score, SearchResult, SharedFrecency, SharedPicker, SharedQueryTracker,
+    DbHealthChecker, Error, FFFMode, FileSearchConfig, FuzzySearchOptions, GrepConfig,
+    PaginationArgs, QueryParser, Score, SearchResult, SharedFrecency, SharedPicker,
+    SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
 use mlua::prelude::*;
@@ -59,15 +60,11 @@ pub fn init_db(
 }
 
 pub fn destroy_frecency_db(_: &Lua, _: ()) -> LuaResult<bool> {
-    let mut frecency = FRECENCY.write().into_lua_result()?;
-    *frecency = None;
-    Ok(true)
+    Ok(FRECENCY.destroy().into_lua_result()?.is_some())
 }
 
 pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
-    let mut query_tracker = QUERY_TRACKER.write().into_lua_result()?;
-    *query_tracker = None;
-    Ok(true)
+    Ok(QUERY_TRACKER.destroy().into_lua_result()?.is_some())
 }
 
 pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
@@ -279,6 +276,7 @@ pub fn live_grep(
         smart_case,
         grep_mode,
         time_budget_ms,
+        trim_whitespace,
     ): (
         String,
         Option<usize>,
@@ -288,6 +286,7 @@ pub fn live_grep(
         Option<bool>,
         Option<String>,
         Option<u64>,
+        Option<bool>,
     ),
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
@@ -313,6 +312,7 @@ pub fn live_grep(
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
+        trim_whitespace: trim_whitespace.unwrap_or(false),
     };
 
     let result = picker.grep(&parsed, &options);
@@ -582,6 +582,18 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
         .into_lua_result()
 }
 
+/// Parse a grep query string and return its text portion (with constraints stripped).
+///
+/// Uses the Rust `GrepConfig` parser as the single source of truth, so Lua
+/// code never needs to re-implement constraint detection.
+pub fn parse_grep_query(lua: &Lua, query: String) -> LuaResult<LuaTable> {
+    let parser = QueryParser::new(GrepConfig);
+    let parsed = parser.parse(&query);
+    let table = lua.create_table()?;
+    table.set("grep_text", parsed.grep_text())?;
+    Ok(table)
+}
+
 pub fn wait_for_initial_scan(_: &Lua, timeout_ms: Option<u64>) -> LuaResult<bool> {
     // Extract the scan signal Arc WITHOUT holding the read lock, so the
     // scan thread can acquire the write lock to store its results.
@@ -822,6 +834,7 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     exports.set("health_check", lua.create_function(health_check)?)?;
     exports.set("shorten_path", lua.create_function(shorten_path)?)?;
     exports.set("hex_dump", lua.create_function(hex_dump::hex_dump)?)?;
+    exports.set("parse_grep_query", lua.create_function(parse_grep_query)?)?;
 
     Ok(exports)
 }
