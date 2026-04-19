@@ -112,8 +112,12 @@ FFF.nvim requires neovim 0.10.0 or higher
 vim.pack.add({ 'https://github.com/dmtrKovalenko/fff.nvim' })
 
 vim.api.nvim_create_autocmd('PackChanged', {
-  callback = function(event)
-    if event.data.updated then
+  callback = function(ev)
+    local name, kind = ev.data.spec.name, ev.data.kind
+    if name == 'fff.nvim' and (kind == 'install' or kind == 'update') then
+      if not ev.data.active then
+        vim.cmd.packadd('fff.nvim')
+      end
       require('fff.download').download_or_build_binary()
     end
   end,
@@ -148,6 +152,7 @@ require('fff').setup({
     max_results = 100,
     max_threads = 4,
     lazy_sync = true, -- set to false if you want file indexing to start on open
+    prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     layout = {
       height = 0.8,
       width = 0.8,
@@ -285,6 +290,7 @@ require('fff').setup({
       smart_case = true, -- Case-insensitive unless query has uppercase
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
+      trim_whitespace = false, -- Strip leading whitespace from matched lines
     },
   })
 ```

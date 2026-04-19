@@ -5,8 +5,9 @@ use fff::frecency::FrecencyTracker;
 use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
-    DbHealthChecker, Error, FFFMode, FileSearchConfig, FuzzySearchOptions, PaginationArgs,
-    QueryParser, Score, SearchResult, SharedFrecency, SharedPicker, SharedQueryTracker,
+    DbHealthChecker, Error, FFFMode, FileSearchConfig, FuzzySearchOptions, GrepConfig,
+    PaginationArgs, QueryParser, Score, SearchResult, SharedFrecency, SharedPicker,
+    SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
 use mlua::prelude::*;
@@ -59,15 +60,11 @@ pub fn init_db(
 }
 
 pub fn destroy_frecency_db(_: &Lua, _: ()) -> LuaResult<bool> {
-    let mut frecency = FRECENCY.write().into_lua_result()?;
-    *frecency = None;
-    Ok(true)
+    Ok(FRECENCY.destroy().into_lua_result()?.is_some())
 }
 
 pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
-    let mut query_tracker = QUERY_TRACKER.write().into_lua_result()?;
-    *query_tracker = None;
-    Ok(true)
+    Ok(QUERY_TRACKER.destroy().into_lua_result()?.is_some())
 }
 
 pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
@@ -83,7 +80,8 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
         FRECENCY.clone(),
         fff::FilePickerOptions {
             base_path,
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -115,7 +113,8 @@ fn reinit_file_picker_internal(path: &Path) -> Result<(), Error> {
         FRECENCY.clone(),
         fff::FilePickerOptions {
             base_path: path.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -218,9 +217,7 @@ pub fn fuzzy_search_files(
     let parser = QueryParser::new(FileSearchConfig);
     let parsed = parser.parse(&query);
 
-    let files = picker.get_files();
-    let results = FilePicker::fuzzy_search(
-        files,
+    let results = picker.fuzzy_search(
         &parsed,
         query_tracker_guard.as_ref(),
         FuzzySearchOptions {
@@ -244,9 +241,9 @@ pub fn fuzzy_search_files(
 
         let path = expand_tilde(pure_query);
         if path.is_absolute() && path.is_file() {
-            if let Ok(idx) = files.binary_search_by(|f| f.as_path().cmp(&path)) {
+            if let Some(found_file) = picker.get_file_by_path(&path) {
                 let found = SearchResult {
-                    items: vec![&files[idx]],
+                    items: vec![found_file],
                     scores: vec![Score {
                         exact_match: true,
                         match_type: "path",
@@ -257,14 +254,14 @@ pub fn fuzzy_search_files(
                     location: parsed.location,
                 };
 
-                return lua_types::SearchResultLua::from(found).into_lua(lua);
+                return lua_types::SearchResultLua::new(found, picker).into_lua(lua);
             }
 
             return build_file_path_fallback(lua, &path, results.total_files);
         }
     }
 
-    lua_types::SearchResultLua::from(results).into_lua(lua)
+    lua_types::SearchResultLua::new(results, picker).into_lua(lua)
 }
 
 #[allow(clippy::type_complexity)]
@@ -279,6 +276,7 @@ pub fn live_grep(
         smart_case,
         grep_mode,
         time_budget_ms,
+        trim_whitespace,
     ): (
         String,
         Option<usize>,
@@ -288,6 +286,7 @@ pub fn live_grep(
         Option<bool>,
         Option<String>,
         Option<u64>,
+        Option<bool>,
     ),
 ) -> LuaResult<LuaValue> {
     let file_picker_guard = FILE_PICKER.read().into_lua_result()?;
@@ -313,10 +312,12 @@ pub fn live_grep(
         before_context: 0,
         after_context: 0,
         classify_definitions: false,
+        trim_whitespace: trim_whitespace.unwrap_or(false),
+        abort_signal: None,
     };
 
     let result = picker.grep(&parsed, &options);
-    lua_types::GrepResultLua::from(result).into_lua(lua)
+    lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
 
 /// Build a file-picker result for an absolute path that exists on disk but
@@ -331,7 +332,6 @@ fn build_file_path_fallback(lua: &Lua, path: &Path, total_files: usize) -> LuaRe
     let path_str = path.to_string_lossy().to_string();
 
     let item = lua.create_table()?;
-    item.set("path", path_str.as_str())?;
     item.set("relative_path", path_str.as_str())?;
     item.set("name", name.as_str())?;
     item.set("size", path.metadata().map(|m| m.len()).unwrap_or(0))?;
@@ -430,6 +430,15 @@ pub fn get_git_root(_: &Lua, _: ()) -> LuaResult<Option<String>> {
     };
 
     Ok(picker.git_root().map(|p| p.to_string_lossy().into_owned()))
+}
+
+pub fn get_base_path(_: &Lua, _: ()) -> LuaResult<Option<String>> {
+    let file_picker = FILE_PICKER.read().into_lua_result()?;
+    let Some(ref picker) = *file_picker else {
+        return Ok(None);
+    };
+
+    Ok(Some(picker.base_path().to_string_lossy().into_owned()))
 }
 
 pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<usize> {
@@ -580,6 +589,18 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
     tracker
         .get_historical_grep_query(&project_path, offset)
         .into_lua_result()
+}
+
+/// Parse a grep query string and return its text portion (with constraints stripped).
+///
+/// Uses the Rust `GrepConfig` parser as the single source of truth, so Lua
+/// code never needs to re-implement constraint detection.
+pub fn parse_grep_query(lua: &Lua, query: String) -> LuaResult<LuaTable> {
+    let parser = QueryParser::new(GrepConfig);
+    let parsed = parser.parse(&query);
+    let table = lua.create_table()?;
+    table.set("grep_text", parsed.grep_text())?;
+    Ok(table)
 }
 
 pub fn wait_for_initial_scan(_: &Lua, timeout_ms: Option<u64>) -> LuaResult<bool> {
@@ -792,6 +813,7 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
         lua.create_function(refresh_git_status)?,
     )?;
     exports.set("get_git_root", lua.create_function(get_git_root)?)?;
+    exports.set("get_base_path", lua.create_function(get_base_path)?)?;
     exports.set(
         "stop_background_monitor",
         lua.create_function(stop_background_monitor)?,
@@ -822,6 +844,7 @@ fn create_exports(lua: &Lua) -> LuaResult<LuaTable> {
     exports.set("health_check", lua.create_function(health_check)?)?;
     exports.set("shorten_path", lua.create_function(shorten_path)?)?;
     exports.set("hex_dump", lua.create_function(hex_dump::hex_dump)?)?;
+    exports.set("parse_grep_query", lua.create_function(parse_grep_query)?)?;
 
     Ok(exports)
 }
