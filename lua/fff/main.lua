@@ -55,6 +55,36 @@ function M.find_in_git_root()
   M.find_files_in_dir(git_root)
 end
 
+--- Clear FFF caches (both in-memory state and on-disk database files)
+--- @param scope? string Cache scope: all|frecency|files
+function M.clear_cache(scope)
+  local fuzzy = require('fff.fuzzy')
+  if not scope or scope == '' then scope = 'all' end
+
+  local errors = {}
+
+  if scope == 'all' or scope == 'files' then
+    local ok, err = pcall(fuzzy.cleanup_file_picker)
+    if not ok then table.insert(errors, 'cleanup file picker: ' .. tostring(err)) end
+  end
+
+  if scope == 'all' or scope == 'frecency' then
+    local ok, err = pcall(fuzzy.destroy_frecency_db)
+    if not ok then table.insert(errors, 'destroy frecency db: ' .. tostring(err)) end
+
+    ok, err = pcall(fuzzy.destroy_query_db)
+    if not ok then table.insert(errors, 'destroy query db: ' .. tostring(err)) end
+  end
+
+  if #errors > 0 then
+    vim.notify('FFF: errors clearing cache: ' .. table.concat(errors, '; '), vim.log.levels.ERROR)
+    return false
+  end
+
+  vim.notify('Cleared FFF cache: ' .. scope, vim.log.levels.INFO)
+  return true
+end
+
 --- Trigger rescan of files in the current directory
 function M.scan_files()
   local fuzzy = require('fff.core').ensure_initialized()
@@ -129,8 +159,9 @@ function M.search_and_show(query)
 
   for i, file in ipairs(files) do
     if i <= 15 then
-      local icon = file.extension ~= '' and '.' .. file.extension or '📄'
-      local frecency = file.frecency_score > 0 and ' ⭐' .. file.frecency_score or ''
+      local file_extension = vim.fn.fnamemodify(file.name, ':e')
+      local icon = file_extension ~= '' and '.' .. file_extension or '📄'
+      local frecency = file.total_frecency_score > 0 and ' ⭐' .. file.total_frecency_score or ''
       print('  ' .. i .. '. ' .. icon .. ' ' .. file.relative_path .. frecency)
     end
   end
@@ -198,8 +229,8 @@ function M.open_file_under_cursor(open_cb)
 
   picker_ui.open_with_callback(full_path_with_suffix, function(files, _, location)
     if #files == 1 or require('fff.file_picker').get_file_score(1).exact_match then
-      if open_cb and type(open_cb) == 'function' then open_cb(files[1].path) end
-      vim.api.nvim_command(string.format('e %s', vim.fn.fnameescape(files[1].path)))
+      if open_cb and type(open_cb) == 'function' then open_cb(files[1].relative_path) end
+      vim.api.nvim_command(string.format('e %s', vim.fn.fnameescape(files[1].relative_path)))
 
       if location then vim.schedule(function() require('fff.location_utils').jump_to_location(location) end) end
 

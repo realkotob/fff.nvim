@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
@@ -31,6 +32,15 @@ impl SharedPicker {
 
     pub fn write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Option<FilePicker>>, Error> {
         Ok(self.0.write())
+    }
+
+    /// Return `true` if this is an instance of the picker that requires a complicated post-scan
+    /// indexing/cache warmup job. The indexing is not crazy but it takes time.
+    pub fn need_complex_rebuild(&self) -> bool {
+        let guard = self.0.read();
+        guard
+            .as_ref()
+            .is_some_and(|p| p.need_enable_mmap_cache() || p.need_enable_content_indexing())
     }
 
     /// Block until the background filesystem scan finishes.
@@ -117,8 +127,20 @@ impl SharedPicker {
 }
 
 /// Thread-safe shared handle to the [`FrecencyTracker`] instance.
-#[derive(Clone, Default)]
-pub struct SharedFrecency(pub(crate) Arc<RwLock<Option<FrecencyTracker>>>);
+#[derive(Clone)]
+pub struct SharedFrecency {
+    inner: Arc<RwLock<Option<FrecencyTracker>>>,
+    enabled: bool,
+}
+
+impl Default for SharedFrecency {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: true,
+        }
+    }
+}
 
 impl std::fmt::Debug for SharedFrecency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,16 +149,27 @@ impl std::fmt::Debug for SharedFrecency {
 }
 
 impl SharedFrecency {
+    /// Creates a disabled instance that silently ignores all writes.
+    pub fn noop() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: false,
+        }
+    }
+
     pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.0.read().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
     }
 
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.0.write().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the frecency tracker, replacing any existing one.
+    /// Initialize the frecency tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut guard = self.write()?;
         *guard = Some(tracker);
         Ok(())
@@ -150,11 +183,47 @@ impl SharedFrecency {
     ) -> crate::Result<std::thread::JoinHandle<()>> {
         FrecencyTracker::spawn_gc(self.clone(), db_path, use_unsafe_no_lock)
     }
+
+    /// Drop the in-memory tracker and delete the on-disk database directory.
+    ///
+    /// Acquires the write lock, ensuring all readers (including any active mmap
+    /// access) are finished before the LMDB environment is closed and the files
+    /// are removed.
+    ///
+    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
+    /// tracker was initialized.
+    pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
+        let mut guard = self.write()?;
+        let Some(tracker) = guard.take() else {
+            return Ok(None);
+        };
+        let db_path = tracker.db_path().to_path_buf();
+        // Drop closes the LMDB env and unmaps the files
+        drop(tracker);
+        drop(guard);
+        std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
+            path: db_path.clone(),
+            source,
+        })?;
+        Ok(Some(db_path))
+    }
 }
 
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
-#[derive(Clone, Default)]
-pub struct SharedQueryTracker(pub(crate) Arc<RwLock<Option<QueryTracker>>>);
+#[derive(Clone)]
+pub struct SharedQueryTracker {
+    inner: Arc<RwLock<Option<QueryTracker>>>,
+    enabled: bool,
+}
+
+impl Default for SharedQueryTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: true,
+        }
+    }
+}
 
 impl std::fmt::Debug for SharedQueryTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,18 +232,52 @@ impl std::fmt::Debug for SharedQueryTracker {
 }
 
 impl SharedQueryTracker {
+    /// Creates a disabled instance that silently ignores all writes.
+    pub fn noop() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: false,
+        }
+    }
+
     pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<QueryTracker>>, Error> {
-        self.0.read().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
     }
 
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<QueryTracker>>, Error> {
-        self.0.write().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the query tracker, replacing any existing one.
+    /// Initialize the query tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut guard = self.write()?;
         *guard = Some(tracker);
         Ok(())
+    }
+
+    /// Drop the in-memory tracker and delete the on-disk database directory.
+    ///
+    /// Acquires the write lock, ensuring all readers (including any active mmap
+    /// access) are finished before the LMDB environment is closed and the files
+    /// are removed.
+    ///
+    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
+    /// tracker was initialized.
+    pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
+        let mut guard = self.write()?;
+        let Some(tracker) = guard.take() else {
+            return Ok(None);
+        };
+        let db_path = tracker.db_path().to_path_buf();
+        drop(tracker);
+        drop(guard);
+        std::fs::remove_dir_all(&db_path).map_err(|source| Error::RemoveDbDir {
+            path: db_path.clone(),
+            source,
+        })?;
+        Ok(Some(db_path))
     }
 }
