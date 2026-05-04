@@ -10,6 +10,26 @@ local list_renderer = require('fff.list_renderer')
 local scrollbar = require('fff.scrollbar')
 local rust = require('fff.rust')
 
+--- Base path of picker can change that's why we can not rely on relative
+--- path for reading/opening files. This function resolves correct absolute path
+--- @param relative_path string|nil
+--- @return string|nil
+local function canonicalize_fff_path(relative_path)
+  if not relative_path or relative_path == '' then return nil end
+  local path = relative_path
+  -- Strip Windows long-path prefix (\\?\) — Neovim cannot open these.
+  if vim.startswith(path, '\\\\?\\') then path = path:sub(5) end
+  -- Already absolute: don't re-anchor.
+  if vim.fn.fnamemodify(path, ':p') == path then return path end
+  local base = conf.get().base_path
+  if not base or base == '' then return path end
+  return vim.fs.normalize(base .. '/' .. path)
+end
+
+--- @param item table|nil
+--- @return string|nil
+local function resolve_item_path(item) return item and canonicalize_fff_path(item.relative_path) or nil end
+
 local BORDER_PRESETS = {
   single = { '┌', '─', '┐', '│', '┘', '─', '└', '│' },
   double = { '╔', '═', '╗', '║', '╝', '═', '╚', '║' },
@@ -115,33 +135,109 @@ local function compute_layout(config)
   local width = math.floor(terminal_width * width_ratio)
   local height = math.floor(terminal_height * height_ratio)
 
-  local col_ratio_default = 0.5 - (width_ratio / 2)
-  local col_ratio = col_ratio_default
+  -- Account for chrome (statusline, tabline, cmdheight) for edge-anchored positions
+  local has_tabline = vim.o.showtabline == 2 or (vim.o.showtabline == 1 and #vim.api.nvim_list_tabpages() > 1)
+  local has_statusline = vim.o.laststatus > 0
+  local top_edge = has_tabline and 1 or 0
+  local bottom_edge = terminal_height - vim.o.cmdheight - (has_statusline and 1 or 0)
+  local usable_height = bottom_edge - top_edge
+  height = math.min(height, usable_height)
+
+  -- Anchor controls default placement; manual col/row overrides still work
+  local anchor = utils.resolve_config_value(
+    config.layout.anchor,
+    terminal_width,
+    terminal_height,
+    function(v)
+      return utils.is_one_of(v, {
+        'center',
+        'top_left',
+        'top',
+        'top_right',
+        'left',
+        'right',
+        'bottom_left',
+        'bottom',
+        'bottom_right',
+      })
+    end,
+    'center',
+    'layout.anchor'
+  )
+
+  -- Compute default positions as direct pixel values.
+  -- Edge-flush anchors compensate for offsets added by calculate_layout_dimensions:
+  --   col: -1 for left (internal +1 on list_col makes it flush)
+  --        -2 for right (internal +1 plus the preview window's independent right border)
+  --   row: -1 for top/bottom (internal +1 on rows; bottom also accounts for chrome via bottom_edge)
+  local center_col = math.floor((terminal_width - width) / 2)
+  local center_row = top_edge + math.floor((usable_height - height) / 2)
+  local anchor_positions = {
+    center = {
+      col = center_col,
+      row = center_row,
+    },
+    top_left = {
+      col = -1,
+      row = top_edge - 1,
+    },
+    top = {
+      col = center_col,
+      row = top_edge - 1,
+    },
+    top_right = {
+      col = terminal_width - width - 2,
+      row = top_edge - 1,
+    },
+    left = {
+      col = -1,
+      row = center_row,
+    },
+    right = {
+      col = terminal_width - width - 2,
+      row = center_row,
+    },
+    bottom_left = {
+      col = -1,
+      row = bottom_edge - height - 1,
+    },
+    bottom = {
+      col = center_col,
+      row = bottom_edge - height - 1,
+    },
+    bottom_right = {
+      col = terminal_width - width - 2,
+      row = bottom_edge - height - 1,
+    },
+  }
+
+  local pos = anchor_positions[anchor] or anchor_positions.center
+  local col = pos.col
+  local row = pos.row
+
+  -- Allow manual ratio overrides (backwards compat)
   if config.layout.col ~= nil then
-    col_ratio = utils.resolve_config_value(
+    local col_ratio = utils.resolve_config_value(
       config.layout.col,
       terminal_width,
       terminal_height,
       utils.is_valid_ratio,
-      col_ratio_default,
+      col / terminal_width,
       'layout.col'
     )
+    col = math.floor(terminal_width * col_ratio)
   end
-  local row_ratio_default = 0.5 - (height_ratio / 2)
-  local row_ratio = row_ratio_default
   if config.layout.row ~= nil then
-    row_ratio = utils.resolve_config_value(
+    local row_ratio = utils.resolve_config_value(
       config.layout.row,
       terminal_width,
       terminal_height,
       utils.is_valid_ratio,
-      row_ratio_default,
+      row / terminal_height,
       'layout.row'
     )
+    row = math.floor(terminal_height * row_ratio)
   end
-
-  local col = math.floor(terminal_width * col_ratio)
-  local row = math.floor(terminal_height * row_ratio)
 
   local prompt_position = get_prompt_position()
   local preview_position = get_preview_position()
@@ -837,13 +933,19 @@ function M.setup_keymaps()
   set_keymap('i', keymaps.move_up, M.move_up, input_opts)
   set_keymap('i', keymaps.move_down, M.move_down, input_opts)
   set_keymap('i', keymaps.cycle_previous_query, M.recall_query_from_history, input_opts)
+  set_keymap('i', keymaps.cycle_forward_query, M.cycle_forward_query, input_opts)
   set_keymap('n', 'j', M.move_down, input_opts)
   set_keymap('n', 'k', M.move_up, input_opts)
   set_keymap('n', keymaps.focus_list, M.focus_list_win, input_opts)
   set_keymap('n', keymaps.focus_preview, M.focus_preview_win, input_opts)
 
-  -- Input buffer: both modes
-  set_keymap({ 'i', 'n' }, keymaps.close, M.close, input_opts)
+  if M.state.config.prompt_vim_mode then
+    set_keymap('n', keymaps.close, M.close, input_opts)
+    set_keymap('i', '<C-c>', M.close, input_opts)
+  else
+    set_keymap({ 'i', 'n' }, keymaps.close, M.close, input_opts)
+  end
+
   set_keymap({ 'i', 'n' }, keymaps.select, M.select, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.select_split, function() M.select('split') end, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.select_vsplit, function() M.select('vsplit') end, input_opts)
@@ -894,6 +996,16 @@ function M.setup_keymaps()
       vim.schedule(function() M.on_input_change() end)
     end,
   })
+
+  if M.state.config.prompt_vim_mode then
+    vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI' }, {
+      buffer = M.state.input_buf,
+      callback = function()
+        local prompt_len = #M.state.config.prompt
+        if vim.fn.col('.') <= prompt_len then vim.fn.cursor(vim.fn.line('.'), prompt_len + 1) end
+      end,
+    })
+  end
 end
 
 function M.focus_input_win()
@@ -1326,7 +1438,7 @@ function M.update_preview_smart()
   end
 
   -- Same file: update immediately (just scrolling/re-highlighting, no file I/O)
-  if M.state.last_preview_file == item.path then
+  if M.state.last_preview_file == item.relative_path then
     M.update_preview()
     return
   end
@@ -1629,7 +1741,7 @@ end
 function M.update_preview_title(item, location)
   if not M.state.preview_win or not vim.api.nvim_win_is_valid(M.state.preview_win) then return end
 
-  local relative_path = item.relative_path or item.path
+  local relative_path = item.relative_path
   local max_title_width = vim.api.nvim_win_get_width(M.state.preview_win)
 
   -- Append :line for grep mode or grep suggestions
@@ -1752,10 +1864,10 @@ function M.update_preview()
 
   local location_changed = not vim.deep_equal(M.state.last_preview_location, effective_location)
 
-  if M.state.last_preview_file == item.path and not location_changed then return end
+  if M.state.last_preview_file == item.relative_path and not location_changed then return end
 
   -- Same file, different location: just scroll and re-highlight instead of reloading
-  if M.state.last_preview_file == item.path and location_changed then
+  if M.state.last_preview_file == item.relative_path and location_changed then
     M.state.last_preview_location = effective_location and vim.deepcopy(effective_location) or nil
     preview.state.location = effective_location
     -- Update title with new line number for grep/suggestion mode
@@ -1770,7 +1882,7 @@ function M.update_preview()
 
   preview.clear()
 
-  M.state.last_preview_file = item.path
+  M.state.last_preview_file = item.relative_path
   M.state.last_preview_location = effective_location and vim.deepcopy(effective_location) or nil
 
   M.update_preview_title(item, effective_location)
@@ -1778,7 +1890,7 @@ function M.update_preview()
   if M.state.file_info_buf then preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor) end
 
   preview.set_preview_window(M.state.preview_win)
-  preview.preview(item.path, M.state.preview_buf, effective_location, item.is_binary)
+  preview.preview(resolve_item_path(item), M.state.preview_buf, effective_location, item.is_binary)
 end
 
 --- Clear preview
@@ -2117,6 +2229,56 @@ function M.recall_query_from_history()
   end)
 end
 
+--- Cycle forward through query history (toward more recent queries).
+--- Complements recall_query_from_history which cycles backward.
+--- Allows bidirectional navigation without losing your place.
+function M.cycle_forward_query()
+  if not M.state.active then return end
+
+  -- Initialize offset on first press (start from most recent, same as backward)
+  if M.state.history_offset == nil then
+    M.state.history_offset = 0
+  elseif M.state.history_offset > 0 then
+    -- Decrement offset to move forward toward more recent queries
+    M.state.history_offset = M.state.history_offset - 1
+  else
+    -- At the most recent entry (offset 0), can't go further forward
+    return
+  end
+
+  -- Fetch query at current offset from Rust (grep and file picker have separate histories)
+  local fuzzy = require('fff.core').ensure_initialized()
+  local history_fn = M.state.mode == 'grep' and fuzzy.get_historical_grep_query or fuzzy.get_historical_query
+  local ok, query = pcall(history_fn, M.state.history_offset)
+
+  if not ok or not query then
+    -- Shouldn't happen since we validated the offset, but handle gracefully
+    M.state.history_offset = nil
+    return
+  end
+
+  if M.state.mode ~= 'grep' then M.state.next_search_force_combo_boost = true end
+
+  -- this is going to trigger the on_input_change handler with the normal search and render flow
+  vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt .. query })
+
+  -- Position cursor at end
+  vim.schedule(function()
+    if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+      vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #M.state.config.prompt + #query })
+    end
+  end)
+end
+
+--- Check whether the given window has 'winfixbuf' enabled.
+--- pcall-guarded so this stays safe on Neovim versions that predate the option.
+--- @param win number Window ID
+--- @return boolean
+local function window_has_winfixbuf(win)
+  local ok, val = pcall(vim.api.nvim_get_option_value, 'winfixbuf', { win = win })
+  return ok and val == true
+end
+
 --- Find the first visible window with a normal file buffer
 --- @return number|nil Window ID of the first suitable window, or nil if none found
 local function find_suitable_window()
@@ -2143,6 +2305,7 @@ local function find_suitable_window()
           and modifiable
           and not is_picker_window
           and filetype ~= 'undotree'
+          and not window_has_winfixbuf(win)
         then
           return win
         end
@@ -2157,7 +2320,9 @@ end
 --- Format: "path:line:col" — uniquely identifies one match entry.
 ---@param item table Grep match item with path, line_number, col
 ---@return string
-local function grep_item_key(item) return string.format('%s:%d:%d', item.path, item.line_number or 0, item.col or 0) end
+local function grep_item_key(item)
+  return string.format('%s:%d:%d', item.relative_path, item.line_number or 0, item.col or 0)
+end
 
 --- Toggle selection for the current item.
 --- In grep mode, selection is per-occurrence (individual match line).
@@ -2170,7 +2335,7 @@ function M.toggle_select()
 
   ---@diagnostic disable-next-line: need-check-nil
   local item = items[M.state.cursor]
-  if not item or not item.path then return end
+  if not item or not item.relative_path then return end
 
   local was_selected
 
@@ -2185,11 +2350,11 @@ function M.toggle_select()
     end
   else
     -- Per-file selection for normal file mode
-    was_selected = M.state.selected_files[item.path]
+    was_selected = M.state.selected_files[item.relative_path]
     if was_selected then
-      M.state.selected_files[item.path] = nil
+      M.state.selected_files[item.relative_path] = nil
     else
-      M.state.selected_files[item.path] = true
+      M.state.selected_files[item.relative_path] = true
     end
   end
 
@@ -2221,12 +2386,15 @@ function M.send_to_quickfix()
     if has_selections then
       -- Use explicitly selected items (survives page changes)
       for _, item in pairs(M.state.selected_items) do
-        table.insert(qf_list, {
-          filename = item.path,
-          lnum = item.line_number or 1,
-          col = (item.col or 0) + 1,
-          text = item.line_content or vim.fn.fnamemodify(item.path, ':.'),
-        })
+        local abs = resolve_item_path(item)
+        if abs then
+          table.insert(qf_list, {
+            filename = abs,
+            lnum = item.line_number or 1,
+            col = (item.col or 0) + 1,
+            text = item.line_content or vim.fn.fnamemodify(abs, ':.'),
+          })
+        end
       end
     else
       -- No selections: run an exhaustive search to get all matches
@@ -2241,12 +2409,13 @@ function M.send_to_quickfix()
       end
 
       for _, item in ipairs(all_items) do
-        if item and item.path then
+        local abs = resolve_item_path(item)
+        if abs then
           table.insert(qf_list, {
-            filename = item.path,
+            filename = abs,
             lnum = item.line_number or 1,
             col = (item.col or 0) + 1,
-            text = item.line_content or vim.fn.fnamemodify(item.path, ':.'),
+            text = item.line_content or vim.fn.fnamemodify(abs, ':.'),
           })
         end
       end
@@ -2255,14 +2424,16 @@ function M.send_to_quickfix()
     -- Normal file mode: per-file entries at line 1
     local paths = {}
 
-    -- Collect from explicit selections, or fall back to all visible items
+    -- Collect from explicit selections, or fall back to all visible items.
+    -- selected_files is keyed by relative_path; filtered_items carries relative_path too.
     if next(M.state.selected_files) then
-      for path, _ in pairs(M.state.selected_files) do
-        table.insert(paths, path)
+      for relative_path, _ in pairs(M.state.selected_files) do
+        table.insert(paths, canonicalize_fff_path(relative_path))
       end
     else
       for _, item in ipairs(M.state.filtered_items) do
-        if item and item.path then table.insert(paths, item.path) end
+        local abs = resolve_item_path(item)
+        if abs then table.insert(paths, abs) end
       end
     end
 
@@ -2285,7 +2456,7 @@ function M.send_to_quickfix()
   local is_grep = M.state.mode == 'grep'
   M.close()
 
-  vim.fn.setqflist(qf_list, 'r')
+  vim.fn.setqflist(qf_list)
   vim.cmd('copen')
 
   local count = #qf_list
@@ -2305,14 +2476,12 @@ function M.select(action)
 
   action = action or 'edit'
 
-  -- Strip Windows long path prefix (\\?\) if present.
-  -- These can surface from Rust's fs::canonicalize on Windows when LongPathsEnabled is set.
-  -- Neovim cannot open paths with this prefix. The Rust side uses dunce::canonicalize to avoid
-  -- producing these, but we strip defensively here as well.
-  local path = item.path
-  if vim.startswith(path, '\\\\?\\') then path = path:sub(5) end
-
-  local relative_path = vim.fn.fnamemodify(path, ':.')
+  -- Anchor against the indexer's base_path (may differ from cwd), then rephrase
+  -- as cwd-relative for a nicer buffer name when possible. When outside cwd,
+  -- fnamemodify(':.') leaves the absolute path intact.
+  local abs_path = resolve_item_path(item)
+  if not abs_path then return end
+  local relative_path = vim.fn.fnamemodify(abs_path, ':.')
   local location = M.state.location -- Capture location before closing
   local query = M.state.query -- Capture query before closing for tracking
   local mode = M.state.mode -- Capture mode before closing for tracking
@@ -2348,17 +2517,28 @@ function M.select(action)
   M.close()
 
   if action == 'edit' then
+    local current_win = vim.api.nvim_get_current_win()
     local current_buf = vim.api.nvim_get_current_buf()
     local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
     local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+    local current_winfixbuf = window_has_winfixbuf(current_win)
 
-    -- If current active buffer is not a normal buffer we find a suitable window with a tab otherwise opening a new split
-    if current_buftype ~= '' or not current_buf_modifiable then
+    -- If the current window can't host a new buffer (special buftype, non-modifiable,
+    -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
+    -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
+    -- whenever the picker is invoked from a window pinned via :h winfixbuf.
+    local opened_via_split = false
+    if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
       local suitable_win = find_suitable_window()
-      if suitable_win then vim.api.nvim_set_current_win(suitable_win) end
+      if suitable_win then
+        vim.api.nvim_set_current_win(suitable_win)
+      elseif current_winfixbuf then
+        vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+        opened_via_split = true
+      end
     end
 
-    vim.cmd('edit ' .. vim.fn.fnameescape(relative_path))
+    if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
   elseif action == 'split' then
     vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
   elseif action == 'vsplit' then
@@ -2379,7 +2559,7 @@ function M.select(action)
         if mode == 'grep' then
           pcall(fff.track_grep_query, query)
         else
-          pcall(fff.track_query_completion, query, item.path)
+          pcall(fff.track_query_completion, query, item.relative_path)
         end
       end
     end

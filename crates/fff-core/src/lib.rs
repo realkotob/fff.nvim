@@ -20,7 +20,7 @@
 //!
 //! ## Shared State
 //!
-//! [`SharedPicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
+//! [`SharedFilePicker`], [`SharedFrecency`], and [`SharedQueryTracker`] are
 //! newtype wrappers around `Arc<RwLock<Option<T>>>` for thread-safe shared
 //! access. They provide `read()` / `write()` methods with built-in error
 //! conversion and convenience helpers like `wait_for_scan()`.
@@ -33,10 +33,10 @@
 //! use fff_search::query_tracker::QueryTracker;
 //! use fff_search::{
 //!     FFFMode, FilePickerOptions, FuzzySearchOptions, PaginationArgs, QueryParser,
-//!     SharedFrecency, SharedPicker, SharedQueryTracker,
+//!     SharedFrecency, SharedFilePicker, SharedQueryTracker,
 //! };
 //!
-//! let shared_picker = SharedPicker::default();
+//! let shared_picker = SharedFilePicker::default();
 //! let shared_frecency = SharedFrecency::default();
 //! let shared_query_tracker = SharedQueryTracker::default();
 //!
@@ -44,10 +44,10 @@
 //! std::fs::create_dir_all(&tmp).unwrap();
 //!
 //! // 1. Optionally initialize frecency and query tracker databases
-//! let frecency = FrecencyTracker::new(tmp.join("frecency"), false)?;
+//! let frecency = FrecencyTracker::open(tmp.join("frecency"))?;
 //! shared_frecency.init(frecency)?;
 //!
-//! let query_tracker = QueryTracker::new(tmp.join("queries"), false)?;
+//! let query_tracker = QueryTracker::open(tmp.join("queries"))?;
 //! shared_query_tracker.init(query_tracker)?;
 //!
 //! // 2. Init the file picker (spawns background scan + watcher)
@@ -73,8 +73,7 @@
 //! let parser = QueryParser::default();
 //! let query = parser.parse("lib.rs");
 //!
-//! let results = FilePicker::fuzzy_search(
-//!     picker.get_files(),
+//! let results = picker.fuzzy_search(
 //!     &query,
 //!     qt_guard.as_ref(),
 //!     FuzzySearchOptions {
@@ -86,14 +85,19 @@
 //! );
 //!
 //! assert!(results.total_matched > 0);
-//! assert!(results.items.first().unwrap().as_path().ends_with("lib.rs"));
+//! assert!(results.items.first().unwrap().relative_path(picker).ends_with("lib.rs"));
 //!
 //! let _ = std::fs::remove_dir_all(&tmp);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
 mod background_watcher;
-mod bigram_filter;
+mod scan;
+// public only for benchmarks — the inverted index is still re-exported via
+// `pub use bigram_filter::*` below for external consumers.
+#[doc(hidden)]
+pub mod bigram_filter;
+pub mod bigram_query;
 mod constraints;
 mod db_healthcheck;
 mod error;
@@ -101,6 +105,8 @@ mod score;
 mod sort_buffer;
 // this is pub only for benchmarks
 pub mod case_insensitive_memmem;
+
+pub(crate) mod simd_path;
 
 /// Core file picker: filesystem indexing, background watching, and fuzzy search.
 ///
@@ -138,6 +144,7 @@ pub mod query_tracker;
 pub mod types;
 
 mod ignore;
+mod lmdb;
 /// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
 /// and [`QueryTracker`].
 pub mod shared;

@@ -10,17 +10,29 @@ use std::sync::{Arc, Mutex};
 
 use crate::cursor::CursorStore;
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
-use fff::file_picker::FilePicker;
-use fff::grep::{self, GrepMode, GrepSearchOptions, has_regex_metacharacters};
+use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
 use fff::types::{FileItem, PaginationArgs};
-use fff::{FuzzySearchOptions, QueryParser, SharedFrecency, SharedPicker};
+use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker, SharedFrecency};
 use fff_query_parser::AiGrepConfig;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 
-/// Strip common delimiters and lowercase for fuzzy fallback queries.
+/// Normalize the caller-supplied `maxResults`.
+///
+/// `None`, `Some(0)`, and non-positive / non-finite values fall back to
+/// `default`. Issue #400 reported that grep returned 0 items for
+/// `maxResults: 0` while `find_files` returned the entire dataset; treating
+/// 0 as "use the default" makes both tools behave consistently.
+fn normalize_max_results(raw: Option<f64>, default: usize) -> usize {
+    match raw {
+        None => default,
+        Some(v) if v <= 0.0 || !v.is_finite() => default,
+        Some(v) => (v.round() as usize).max(1),
+    }
+}
+
 fn cleanup_fuzzy_query(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -31,7 +43,6 @@ fn cleanup_fuzzy_query(s: &str) -> String {
     out
 }
 
-/// Compute grep search options from output mode and context settings.
 fn make_grep_options(
     output_mode: OutputMode,
     mode: GrepMode,
@@ -64,6 +75,8 @@ fn make_grep_options(
             before_context: ctx_lines,
             after_context: after_ctx,
             classify_definitions: true,
+            trim_whitespace: true,
+            abort_signal: None,
         },
         auto_expand,
     )
@@ -72,6 +85,9 @@ fn make_grep_options(
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindFilesParams {
     /// Fuzzy search query. Supports path prefixes and glob constraints.
+    // `pattern` alias for consistency with grep's alias and the common
+    // file-search parameter name (#311).
+    #[serde(alias = "pattern")]
     pub query: String,
     /// Max results (default 20).
     #[serde(rename = "maxResults")]
@@ -85,6 +101,10 @@ pub struct FindFilesParams {
 pub struct GrepParams {
     /// Search text or regex query with optional constraint prefixes.
     /// Matches within single lines only — use ONE specific term, not multiple words.
+    // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
+    // routinely call grep with `pattern`; accept it instead of erroring out
+    // with an unhelpful "missing field `query`" (#311).
+    #[serde(alias = "pattern")]
     pub query: String,
     /// Max matching lines (default 20).
     #[serde(rename = "maxResults")]
@@ -161,7 +181,7 @@ pub struct MultiGrepParams {
 
 #[derive(Clone)]
 pub struct FffServer {
-    picker: SharedPicker,
+    picker: SharedFilePicker,
     #[allow(dead_code)]
     frecency: SharedFrecency,
     cursor_store: Arc<Mutex<CursorStore>>,
@@ -170,7 +190,7 @@ pub struct FffServer {
 }
 
 impl FffServer {
-    pub fn new(picker: SharedPicker, frecency: SharedFrecency) -> Self {
+    pub fn new(picker: SharedFilePicker, frecency: SharedFrecency) -> Self {
         Self {
             picker,
             frecency,
@@ -180,7 +200,6 @@ impl FffServer {
         }
     }
 
-    /// Wait for the initial file scan to complete.
     #[allow(dead_code)]
     pub fn wait_for_scan(&self) {
         loop {
@@ -198,15 +217,12 @@ impl FffServer {
         }
     }
 
-    /// Lock the cursor store, returning an MCP error on poisoned mutex.
     fn lock_cursors(&self) -> Result<std::sync::MutexGuard<'_, CursorStore>, ErrorData> {
         self.cursor_store.lock().map_err(|e| {
             ErrorData::internal_error(format!("Failed to acquire cursor store lock: {e}"), None)
         })
     }
 
-    /// If an update notice is available and hasn't been sent yet, append it
-    /// to the tool result. Called once per server lifetime (first tool call).
     fn maybe_append_update_notice(&self, result: &mut CallToolResult) {
         if self.update_notice_sent.swap(true, Ordering::Relaxed) {
             return;
@@ -220,11 +236,6 @@ impl FffServer {
         result.content.push(Content::text(notice));
     }
 
-    /// Perform grep with auto-retry logic.
-    ///
-    /// Acquires the picker read-lock once and holds it for the entire
-    /// operation, so `GrepResult` references are used directly — no cloning.
-    /// Always uses AI query parsing since this is an MCP server for AI agents.
     fn perform_grep(
         &self,
         query: &str,
@@ -283,11 +294,11 @@ impl FffServer {
                             files: &retry_result.files,
                             total_matched: retry_result.matches.len(),
                             next_file_offset: retry_result.next_file_offset,
-                            regex_fallback_error: retry_result.regex_fallback_error.as_deref(),
                             output_mode,
                             max_results,
                             show_context: ctx_lines > 0,
                             auto_expand_defs: auto_expand,
+                            picker,
                         }
                         .format(&mut cs);
                         return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -310,11 +321,12 @@ impl FffServer {
                     "0 exact matches. {} approximate:",
                     fuzzy_result.matches.len()
                 ));
-                let mut current_file = "";
+                let mut current_file = String::new();
                 for m in fuzzy_result.matches.iter().take(3) {
                     let file = fuzzy_result.files[m.file_index];
-                    if file.relative_path() != current_file {
-                        current_file = file.relative_path();
+                    let file_rel = file.relative_path(picker);
+                    if file_rel != current_file {
+                        current_file = file_rel;
                         lines.push(current_file.to_string());
                     }
                     lines.push(format!(" {}: {}", m.line_number, m.line_content));
@@ -339,8 +351,7 @@ impl FffServer {
                         limit: 1,
                     },
                 };
-                let file_result =
-                    FilePicker::fuzzy_search(picker.get_files(), &file_query, None, file_opts);
+                let file_result = picker.fuzzy_search(&file_query, None, file_opts);
                 if let (Some(top), Some(score)) =
                     (file_result.items.first(), file_result.scores.first())
                 {
@@ -349,7 +360,7 @@ impl FffServer {
                     if score.base_score > query_len * 10 {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "0 content matches. But there is a relevant file path: {}",
-                            top.relative_path()
+                            top.relative_path(picker)
                         ))]));
                     }
                 }
@@ -372,11 +383,11 @@ impl FffServer {
             files: &result.files,
             total_matched: result.matches.len(),
             next_file_offset: result.next_file_offset,
-            regex_fallback_error: result.regex_fallback_error.as_deref(),
             output_mode,
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            picker,
         }
         .format(&mut cs);
 
@@ -399,7 +410,7 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<FindFilesParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let max_results = params.max_results.unwrap_or(20.0).round() as usize; // safe
+        let max_results = normalize_max_results(params.max_results, 20);
         let query = &params.query;
 
         let page_offset = params
@@ -414,8 +425,6 @@ impl FffServer {
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
-
-        let files = picker.get_files();
         let base_path = picker.base_path();
         let make_opts = |offset: usize| FuzzySearchOptions {
             max_threads: 0,
@@ -431,7 +440,7 @@ impl FffServer {
 
         let parser = QueryParser::default();
         let fff_query = parser.parse(query);
-        let result = FilePicker::fuzzy_search(files, &fff_query, None, make_opts(page_offset));
+        let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
         let total_files = result.total_files;
 
         // Auto-retry with fewer terms if 3+ words return 0 results
@@ -442,12 +451,7 @@ impl FffServer {
             if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
                 if let Some(shorter) = &shorter {
                     let shorter_query = parser.parse(shorter);
-                    let retry = FilePicker::fuzzy_search(
-                        files,
-                        &shorter_query,
-                        /*query_tracker=*/ None,
-                        make_opts(0),
-                    );
+                    let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
 
                     (retry.items, retry.scores, retry.total_matched)
                 } else {
@@ -472,12 +476,12 @@ impl FffServer {
             if is_exact_match {
                 lines.push(format!(
                     "→ Read {} (exact match!)",
-                    top_item.relative_path()
+                    top_item.relative_path(picker)
                 ));
             } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
                 lines.push(format!(
                     "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path()
+                    top_item.relative_path(picker)
                 ));
             }
         }
@@ -492,7 +496,7 @@ impl FffServer {
         for item in &items {
             lines.push(format!(
                 "{}{}",
-                item.relative_path(),
+                item.relative_path(picker),
                 file_suffix(item.git_status, item.total_frecency_score())
             ));
         }
@@ -518,7 +522,7 @@ impl FffServer {
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let max_results = params.max_results.unwrap_or(20.0) as usize;
+        let max_results = normalize_max_results(params.max_results, 20);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
         let parsed = QueryParser::new(AiGrepConfig).parse(&params.query);
@@ -560,7 +564,7 @@ impl FffServer {
 
 impl FffServer {
     fn multi_grep_inner(&self, params: MultiGrepParams) -> Result<CallToolResult, ErrorData> {
-        let max_results = params.max_results.unwrap_or(20.0).round() as usize;
+        let max_results = normalize_max_results(params.max_results, 20);
         let context = params.context.map(|v| v.round() as usize);
         let output_mode = OutputMode::new(params.output_mode.as_deref());
 
@@ -581,17 +585,13 @@ impl FffServer {
         let picker = guard
             .as_ref()
             .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
-
         let patterns_refs: Vec<&str> = params.patterns.iter().map(|s| s.as_str()).collect();
 
         let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
         let parsed_constraints = parser.parse(constraint_query);
         let constraints = parsed_constraints.constraints.as_slice();
 
-        let files = picker.get_files();
-        let budget = picker.cache_budget();
-        let result =
-            grep::multi_grep_search(files, &patterns_refs, constraints, &options, budget, None);
+        let result = picker.multi_grep(&patterns_refs, constraints, &options);
         let file_refs: Vec<&FileItem> = result.files.to_vec();
 
         if result.matches.is_empty() && file_offset == 0 {
@@ -613,8 +613,7 @@ impl FffServer {
                 };
 
                 let parsed = parser.parse(&full_query);
-                let fb_result =
-                    grep::grep_search(files, &parsed, &fallback_options, budget, None, None, None);
+                let fb_result = picker.grep(&parsed, &fallback_options);
 
                 if !fb_result.matches.is_empty() {
                     let fb_file_refs: Vec<&FileItem> = fb_result.files.to_vec();
@@ -624,11 +623,11 @@ impl FffServer {
                         files: &fb_file_refs,
                         total_matched: fb_result.matches.len(),
                         next_file_offset: fb_result.next_file_offset,
-                        regex_fallback_error: None,
                         output_mode,
                         max_results,
                         show_context: false,
                         auto_expand_defs: auto_expand,
+                        picker,
                     }
                     .format(&mut cs);
                     return Ok(CallToolResult::success(vec![Content::text(format!(
@@ -655,11 +654,11 @@ impl FffServer {
             files: &file_refs,
             total_matched: result.matches.len(),
             next_file_offset: result.next_file_offset,
-            regex_fallback_error: None,
             output_mode,
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
+            picker,
         }
         .format(&mut cs);
 
@@ -680,5 +679,64 @@ impl ServerHandler for FffServer {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("fff", env!("CARGO_PKG_VERSION")))
             .with_instructions(instructions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_max_results_none_uses_default() {
+        assert_eq!(normalize_max_results(None, 20), 20);
+    }
+
+    #[test]
+    fn normalize_max_results_zero_uses_default() {
+        // Issue #400: `maxResults: 0` must not return zero items for grep
+        // while `find_files` returns the full set. Both tools now map 0 to
+        // the default limit.
+        assert_eq!(normalize_max_results(Some(0.0), 20), 20);
+    }
+
+    #[test]
+    fn normalize_max_results_negative_uses_default() {
+        assert_eq!(normalize_max_results(Some(-5.0), 20), 20);
+    }
+
+    #[test]
+    fn normalize_max_results_non_finite_uses_default() {
+        assert_eq!(normalize_max_results(Some(f64::NAN), 20), 20);
+        assert_eq!(normalize_max_results(Some(f64::INFINITY), 20), 20);
+    }
+
+    #[test]
+    fn normalize_max_results_rounds_and_clamps() {
+        assert_eq!(normalize_max_results(Some(0.4), 20), 1);
+        assert_eq!(normalize_max_results(Some(10.0), 20), 10);
+        assert_eq!(normalize_max_results(Some(10.7), 20), 11);
+    }
+
+    #[test]
+    fn grep_params_accepts_pattern_alias() {
+        // Issue #311: LLMs flip between `query` and `pattern`; accept both.
+        let via_query: GrepParams =
+            serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
+        assert_eq!(via_query.query, "foo");
+
+        let via_pattern: GrepParams =
+            serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
+        assert_eq!(via_pattern.query, "foo");
+    }
+
+    #[test]
+    fn find_files_params_accepts_pattern_alias() {
+        let via_query: FindFilesParams =
+            serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
+        assert_eq!(via_query.query, "foo");
+
+        let via_pattern: FindFilesParams =
+            serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
+        assert_eq!(via_pattern.query, "foo");
     }
 }

@@ -1,5 +1,5 @@
 use fff::file_picker::{FFFMode, FilePicker};
-use fff::{FuzzySearchOptions, PaginationArgs, QueryParser, SharedFrecency, SharedPicker};
+use fff::{FuzzySearchOptions, PaginationArgs, QueryParser, SharedFilePicker, SharedFrecency};
 use std::env;
 use std::thread;
 use std::time::Duration;
@@ -60,7 +60,7 @@ fn format_bytes(bytes: usize) -> String {
 }
 
 fn test_search_memory_pattern(
-    shared_picker: &SharedPicker,
+    shared_picker: &SharedFilePicker,
     name: &str,
     iterations: usize,
     query_pattern: impl Fn(usize) -> String,
@@ -87,8 +87,7 @@ fn test_search_memory_pattern(
             if let Some(ref picker) = *guard {
                 let parser = QueryParser::default();
                 let parsed = parser.parse(&query);
-                let search_result = FilePicker::fuzzy_search(
-                    picker.get_files(),
+                let search_result = picker.fuzzy_search(
                     &parsed,
                     None,
                     FuzzySearchOptions {
@@ -178,7 +177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Create shared state
-    let shared_picker = SharedPicker::default();
+    let shared_picker = SharedFilePicker::default();
     let shared_frecency = SharedFrecency::default();
 
     // Initialize FilePicker
@@ -188,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path: base_path.clone(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

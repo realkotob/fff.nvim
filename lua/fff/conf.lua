@@ -33,6 +33,7 @@ local M = {}
 --- @field toggle_debug string
 --- @field cycle_grep_modes string
 --- @field cycle_previous_query string
+--- @field cycle_forward_query string
 --- @field toggle_select string
 --- @field send_to_quickfix string
 --- @field focus_list string
@@ -54,6 +55,7 @@ local M = {}
 --- @field smart_case boolean
 --- @field time_budget_ms number
 --- @field modes string[]
+--- @field trim_whitespace boolean
 
 --- @class FffConfig
 --- @field base_path string
@@ -62,6 +64,7 @@ local M = {}
 --- @field max_results number
 --- @field max_threads number
 --- @field lazy_sync boolean
+--- @field prompt_vim_mode boolean
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
@@ -195,6 +198,7 @@ local function init()
     max_results = 100,
     max_threads = 4,
     lazy_sync = true, -- set to false if you want file indexing to start on open
+    prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     layout = {
       height = 0.8,
       width = 0.8,
@@ -244,6 +248,8 @@ local function init()
       cycle_grep_modes = '<S-Tab>',
       -- goes to the previous query in history
       cycle_previous_query = '<C-Up>',
+      -- goes to the next query in history (forward)
+      cycle_forward_query = '<C-Down>',
       -- multi-select keymaps for quickfix
       toggle_select = '<Tab>',
       send_to_quickfix = '<C-q>',
@@ -332,6 +338,7 @@ local function init()
       smart_case = true, -- Case-insensitive unless query has uppercase
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
+      trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
     },
   }
 
